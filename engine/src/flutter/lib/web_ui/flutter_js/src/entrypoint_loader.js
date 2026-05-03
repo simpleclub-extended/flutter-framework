@@ -2,6 +2,7 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+import { lookupIntegrity } from "./integrity.js";
 import { resolveUrlWithSegments } from "./utils.js";
 
 /**
@@ -197,7 +198,7 @@ export class FlutterEntrypointLoader {
   }
 
   /**
-   * Creates a script tag for the given URL.
+   * Creates a script tag for the given URL, with optional Subresource Integrity and TrustedTypes validation.
    * @param {string} url
    * @returns {HTMLScriptElement}
    */
@@ -206,6 +207,12 @@ export class FlutterEntrypointLoader {
     scriptTag.type = "application/javascript";
     if (nonce) {
       scriptTag.nonce = nonce;
+    }
+    // Apply Subresource Integrity validaton, if available.
+    const integrity = lookupIntegrity(url);
+    if (integrity) {
+      scriptTag.integrity = integrity;
+      scriptTag.crossOrigin = "anonymous";
     }
     // Apply TrustedTypes validation, if available.
     let trustedUrl = url;

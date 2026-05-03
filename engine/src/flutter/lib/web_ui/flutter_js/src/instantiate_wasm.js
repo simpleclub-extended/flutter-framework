@@ -2,6 +2,8 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+import { verifyAgainstWasmHash } from "./integrity.js";
+
 /**
  * Creates a WASM instantiator that uses Cross-Origin Storage (COS) if available.
  *
@@ -74,7 +76,22 @@ export const createWasmInstantiator = (url, filename) => {
     return response;
   };
 
-  const modulePromise = WebAssembly.compileStreaming(getResponse());
+  // todo: This is a point worth discussing how valuable it is to validate the hash here in sacrifice of compiling while
+  //  streaming.
+  // When we have a known-good hash for this wasm module, we always
+  // verify the bytes BEFORE letting them reach `WebAssembly.compile`.
+  // Browsers do not apply SRI to `fetch()` or `compileStreaming(...)`
+  // automatically; this is the only portable way to enforce integrity.
+  // See https://www.w3.org/TR/SRI/ ("Sub-Resource Integrity does not
+  // apply to imports or fetch by default").
+  const modulePromise = hash
+      ? (async () => {
+          const response = await getResponse();
+          const buffer = await response.arrayBuffer();
+          await verifyAgainstWasmHash(buffer, hash, url);
+          return WebAssembly.compile(buffer);
+        })()
+      : WebAssembly.compileStreaming(getResponse());
   return (imports, successCallback) => {
     (async () => {
       const module = await modulePromise;
