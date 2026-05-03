@@ -2,6 +2,9 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file.
 
+import 'dart:convert';
+
+import 'package:crypto/crypto.dart' as crypto;
 import 'package:file_testing/file_testing.dart';
 import 'package:flutter_tools/src/artifacts.dart';
 import 'package:flutter_tools/src/base/file_system.dart';
@@ -253,6 +256,515 @@ name: foo
       );
     }),
   );
+
+  group('--sri', () {
+    String expectedIntegrity(List<int> bytes, {String algo = 'sha384'}) {
+      final crypto.Hash hash = switch (algo) {
+        'sha256' => crypto.sha256,
+        'sha384' => crypto.sha384,
+        'sha512' => crypto.sha512,
+        _ => throw ArgumentError(algo),
+      };
+      return '$algo-${base64.encode(hash.convert(bytes).bytes)}';
+    }
+
+    Future<void> runFullPipeline() async {
+      final Directory webResources = environment.projectDir.childDirectory('web');
+      webResources.childFile('index.html').createSync(recursive: true);
+      webResources.childFile('index.html').writeAsStringSync('''
+<!DOCTYPE html><html><head><base href="$kBaseHrefPlaceholder">
+<script src="flutter_bootstrap.js" async></script>
+</head><body></body></html>
+''');
+      environment.buildDir.childFile('main.dart.js').createSync();
+      environment.buildDir.childFile('main.dart.js').writeAsStringSync(
+        '// fake main.dart.js\n',
+      );
+
+      await WebTemplatedFiles(<Map<String, Object?>>[]).build(environment);
+      await WebReleaseBundle(<WebCompilerConfig>[
+        const JsCompilerConfig(),
+      ], const NoOpAnalytics()).build(environment);
+      await WebIntegrity(globals.fs, <WebCompilerConfig>[
+        const JsCompilerConfig(),
+      ], const NoOpAnalytics()).build(environment);
+    }
+
+    test(
+      'WebIntegrity is a no-op when SRI is disabled',
+      () => testbed.run(() async {
+        await runFullPipeline();
+        expect(
+          environment.outputDir.childFile('integrity_manifest.json').existsSync(),
+          isFalse,
+        );
+        final String html = environment.outputDir.childFile('index.html').readAsStringSync();
+        expect(html, isNot(contains('integrity=')));
+        expect(html, isNot(contains('type="importmap"')));
+        expect(html, isNot(contains("type='importmap'")));
+      }),
+    );
+
+    test(
+      'WebIntegrity injects SRI on <script src=flutter_bootstrap.js> when --sri is on',
+      () => testbed.run(() async {
+        environment.defines[kSriEnabled] = 'true';
+        environment.defines[kSriAlgorithm] = 'sha384';
+        await runFullPipeline();
+
+        final File bootstrap = environment.outputDir.childFile('flutter_bootstrap.js');
+        expect(bootstrap.existsSync(), isTrue);
+        final String expectedHash = expectedIntegrity(bootstrap.readAsBytesSync());
+        final String html =
+            environment.outputDir.childFile('index.html').readAsStringSync();
+        expect(html, contains('integrity="$expectedHash"'));
+        expect(html, contains('crossorigin="anonymous"'));
+      }),
+    );
+
+    test(
+      'WebIntegrity injects <script type="importmap"> with module integrity',
+      () => testbed.run(() async {
+        environment.defines[kSriEnabled] = 'true';
+        environment.defines[kSriAlgorithm] = 'sha384';
+        await runFullPipeline();
+
+        final String html =
+            environment.outputDir.childFile('index.html').readAsStringSync();
+        final List<RegExpMatch> matches = RegExp(
+          r'<script[^>]*type="importmap"',
+          caseSensitive: false,
+        ).allMatches(html).toList();
+        expect(matches, hasLength(1));
+
+        // The map is anchored at the very top of <head>, before any other
+        // <script>/<link> tag, so it is parsed before any module load.
+        final int importMapIdx = html.indexOf(
+          RegExp(r'<script[^>]*type="importmap"', caseSensitive: false),
+        );
+        final int firstScriptIdx = html.indexOf(
+          RegExp(r'<script\s+src=', caseSensitive: false),
+        );
+        expect(
+          importMapIdx,
+          lessThan(firstScriptIdx),
+          reason: 'import map must precede any module-loading script',
+        );
+
+        // Extract the JSON body and verify it carries the same hash for
+        // main.dart.js as the engine-side `_flutter.buildConfig.integrity`.
+        final RegExpMatch? body = RegExp(
+          r'<script[^>]*type="importmap"[^>]*>(.+?)</script>',
+          caseSensitive: false,
+          dotAll: true,
+        ).firstMatch(html);
+        expect(body, isNotNull);
+        final Map<String, Object?> decoded =
+            jsonDecode(body!.group(1)!) as Map<String, Object?>;
+        final Map<String, Object?> integrityMap =
+            decoded['integrity']! as Map<String, Object?>;
+        expect(integrityMap, contains('main.dart.js'));
+        expect(integrityMap, contains('flutter_bootstrap.js'));
+        expect(integrityMap['main.dart.js'], startsWith('sha384-'));
+      }),
+    );
+
+    test(
+      'WebIntegrity is idempotent — re-running does not double-inject the import map',
+      () => testbed.run(() async {
+        environment.defines[kSriEnabled] = 'true';
+        await runFullPipeline();
+        // Second pass on the same output dir.
+        await WebIntegrity(globals.fs, <WebCompilerConfig>[
+          const JsCompilerConfig(),
+        ], const NoOpAnalytics()).build(environment);
+
+        final String html =
+            environment.outputDir.childFile('index.html').readAsStringSync();
+        final int matches = RegExp(
+          r'<script[^>]*type="importmap"',
+          caseSensitive: false,
+        ).allMatches(html).length;
+        expect(matches, equals(1));
+      }),
+    );
+
+    test(
+      'WebIntegrity injects inline window._flutter.integrityMap script',
+      () => testbed.run(() async {
+        environment.defines[kSriEnabled] = 'true';
+        await runFullPipeline();
+
+        final String html = environment.outputDir
+            .childFile('index.html')
+            .readAsStringSync();
+        expect(html, contains('window._flutter.integrityMap = '));
+        expect(html, contains('"sameOrigin":'));
+        expect(html, contains('"main.dart.js":"sha384-'));
+        // The integrity map covers flutter_bootstrap.js itself, because the
+        // single-pass design hashes its on-disk bytes directly.
+        expect(html, contains('"flutter_bootstrap.js":"sha384-'));
+        // Engine reads from window._flutter.integrityMap (NOT from the
+        // bootstrap's _flutter.buildConfig.integrity).
+        final String bootstrap = environment.outputDir
+            .childFile('flutter_bootstrap.js')
+            .readAsStringSync();
+        expect(bootstrap, isNot(contains('"integrity":')));
+      }),
+    );
+
+    test(
+      'inline integrityMap script runs before flutter_bootstrap.js',
+      () => testbed.run(() async {
+        environment.defines[kSriEnabled] = 'true';
+        await runFullPipeline();
+
+        final String html = environment.outputDir
+            .childFile('index.html')
+            .readAsStringSync();
+        final int integrityIdx = html.indexOf('window._flutter.integrityMap');
+        final int bootstrapIdx = html.indexOf(
+          RegExp(r'<script\s+[^>]*src="flutter_bootstrap\.js"',
+              caseSensitive: false),
+        );
+        expect(integrityIdx, isNonNegative);
+        expect(bootstrapIdx, isNonNegative);
+        expect(
+          integrityIdx,
+          lessThan(bootstrapIdx),
+          reason: 'The integrity map must be visible to the engine loader '
+              'before the bootstrap kicks off main.dart.js loading.',
+        );
+      }),
+    );
+
+    test(
+      'WebIntegrity emits an integrity_manifest.json sidecar',
+      () => testbed.run(() async {
+        environment.defines[kSriEnabled] = 'true';
+        environment.defines[kSriAlgorithm] = 'sha512';
+        await runFullPipeline();
+
+        final File manifest =
+            environment.outputDir.childFile('integrity_manifest.json');
+        expect(manifest.existsSync(), isTrue);
+        final Map<String, Object?> decoded =
+            jsonDecode(manifest.readAsStringSync()) as Map<String, Object?>;
+        expect(decoded['algorithm'], equals('sha512'));
+        final Map<String, Object?> sameOrigin =
+            decoded['sameOrigin']! as Map<String, Object?>;
+        expect(sameOrigin, contains('main.dart.js'));
+        expect(sameOrigin, contains('flutter_bootstrap.js'));
+      }),
+    );
+
+    test(
+      'IntegrityConfig.fromDefines reads SRI knobs out of Environment.defines',
+      () {
+        const IntegrityConfig disabled = IntegrityConfig.disabled;
+        expect(disabled.enabled, isFalse);
+
+        final IntegrityConfig fromDefinesOff =
+            IntegrityConfig.fromDefines(<String, String>{});
+        expect(fromDefinesOff.enabled, isFalse);
+
+        final IntegrityConfig fromDefinesOn =
+            IntegrityConfig.fromDefines(<String, String>{
+          kSriEnabled: 'true',
+        });
+        expect(fromDefinesOn.enabled, isTrue);
+        expect(fromDefinesOn.algorithm, equals('sha384'));
+
+        final IntegrityConfig withAlgo =
+            IntegrityConfig.fromDefines(<String, String>{
+          kSriEnabled: 'true',
+          kSriAlgorithm: 'sha512',
+        });
+        expect(withAlgo.algorithm, equals('sha512'));
+      },
+    );
+
+    test(
+      'WebIntegrity preserves single-quoted attributes when stamping',
+      () => testbed.run(() async {
+        environment.defines[kSriEnabled] = 'true';
+        final Directory webResources = environment.projectDir.childDirectory('web');
+        webResources.childFile('index.html').createSync(recursive: true);
+        // Single-quoted src — the regex-based stamper used to copy whatever
+        // quote style it found; the parse-based one always emits double
+        // quotes for the new attributes but must not touch the existing
+        // src=' …' bytes.
+        webResources.childFile('index.html').writeAsStringSync('''
+<!DOCTYPE html><html><head><base href="$kBaseHrefPlaceholder">
+<script src='flutter_bootstrap.js' async></script>
+</head><body></body></html>
+''');
+        environment.buildDir.childFile('main.dart.js').createSync();
+        environment.buildDir.childFile('main.dart.js').writeAsStringSync('// fake\n');
+
+        await WebTemplatedFiles(<Map<String, Object?>>[]).build(environment);
+        await WebReleaseBundle(<WebCompilerConfig>[
+          const JsCompilerConfig(),
+        ], const NoOpAnalytics()).build(environment);
+        await WebIntegrity(globals.fs, <WebCompilerConfig>[
+          const JsCompilerConfig(),
+        ], const NoOpAnalytics()).build(environment);
+
+        final String html =
+            environment.outputDir.childFile('index.html').readAsStringSync();
+        // Original src kept its single quotes …
+        expect(html, contains("src='flutter_bootstrap.js'"));
+        // … and the new attributes were inserted as double-quoted.
+        expect(html, contains('integrity="sha384-'));
+        expect(html, contains('crossorigin="anonymous"'));
+      }),
+    );
+
+    test(
+      'WebIntegrity does not double-stamp tags that already have integrity',
+      () => testbed.run(() async {
+        environment.defines[kSriEnabled] = 'true';
+        final Directory webResources = environment.projectDir.childDirectory('web');
+        webResources.childFile('index.html').createSync(recursive: true);
+        // User has hand-stamped a fake integrity (e.g. for a vendored
+        // bootstrap) — we must leave it alone.
+        webResources.childFile('index.html').writeAsStringSync('''
+<!DOCTYPE html><html><head><base href="$kBaseHrefPlaceholder">
+<script src="flutter_bootstrap.js" integrity="sha384-USERSUPPLIED" async></script>
+</head><body></body></html>
+''');
+        environment.buildDir.childFile('main.dart.js').createSync();
+        environment.buildDir.childFile('main.dart.js').writeAsStringSync('// fake\n');
+
+        await WebTemplatedFiles(<Map<String, Object?>>[]).build(environment);
+        await WebReleaseBundle(<WebCompilerConfig>[
+          const JsCompilerConfig(),
+        ], const NoOpAnalytics()).build(environment);
+        await WebIntegrity(globals.fs, <WebCompilerConfig>[
+          const JsCompilerConfig(),
+        ], const NoOpAnalytics()).build(environment);
+
+        final String html =
+            environment.outputDir.childFile('index.html').readAsStringSync();
+        expect(html, contains('integrity="sha384-USERSUPPLIED"'));
+        // The hand-stamped <script src> is left untouched: exactly one
+        // `integrity="…"` on it (no second one spliced in).
+        final RegExpMatch? bootstrapTag = RegExp(
+          r'<script\b[^>]*src="flutter_bootstrap\.js"[^>]*>',
+          caseSensitive: false,
+        ).firstMatch(html);
+        expect(bootstrapTag, isNotNull);
+        final int integrityCount =
+            'integrity='.allMatches(bootstrapTag!.group(0)!).length;
+        expect(integrityCount, equals(1),
+            reason: 'auto-stamping must skip tags that already have integrity');
+      }),
+    );
+
+    test(
+      'WebIntegrity skips link rels we do not protect (e.g. icon)',
+      () => testbed.run(() async {
+        environment.defines[kSriEnabled] = 'true';
+        final Directory webResources = environment.projectDir.childDirectory('web');
+        webResources.childFile('index.html').createSync(recursive: true);
+        // We hash icon.png (it's a wasm-extension match would be wrong here;
+        // .css is hashed, .png is not). The point is: even if the file were
+        // hashable, `<link rel="icon">` is not an SRI-protected rel.
+        webResources.childFile('icon.css').createSync(recursive: true);
+        webResources.childFile('icon.css').writeAsStringSync('body{}\n');
+        webResources.childFile('index.html').writeAsStringSync('''
+<!DOCTYPE html><html><head><base href="$kBaseHrefPlaceholder">
+<link rel="icon" href="icon.css">
+<link rel="stylesheet" href="icon.css">
+<script src="flutter_bootstrap.js" async></script>
+</head><body></body></html>
+''');
+        environment.buildDir.childFile('main.dart.js').createSync();
+        environment.buildDir.childFile('main.dart.js').writeAsStringSync('// fake\n');
+
+        await WebTemplatedFiles(<Map<String, Object?>>[]).build(environment);
+        await WebReleaseBundle(<WebCompilerConfig>[
+          const JsCompilerConfig(),
+        ], const NoOpAnalytics()).build(environment);
+        await WebIntegrity(globals.fs, <WebCompilerConfig>[
+          const JsCompilerConfig(),
+        ], const NoOpAnalytics()).build(environment);
+
+        final String html =
+            environment.outputDir.childFile('index.html').readAsStringSync();
+        // The stylesheet got stamped, the icon did not.
+        final RegExpMatch? iconLink =
+            RegExp(r'<link\b[^>]*rel="icon"[^>]*>').firstMatch(html);
+        expect(iconLink, isNotNull);
+        expect(iconLink!.group(0), isNot(contains('integrity=')));
+        final RegExpMatch? styleLink =
+            RegExp(r'<link\b[^>]*rel="stylesheet"[^>]*>').firstMatch(html);
+        expect(styleLink, isNotNull);
+        expect(styleLink!.group(0), contains('integrity="sha384-'));
+      }),
+    );
+
+    test(
+      'WebIntegrity stamps integrity on the injected importmap and integrityMap script',
+      () => testbed.run(() async {
+        environment.defines[kSriEnabled] = 'true';
+        environment.defines[kSriAlgorithm] = 'sha384';
+        await runFullPipeline();
+
+        final String html =
+            environment.outputDir.childFile('index.html').readAsStringSync();
+
+        String hashOf(String body) {
+          final crypto.Digest d = crypto.sha384.convert(utf8.encode(body));
+          return 'sha384-${base64.encode(d.bytes)}';
+        }
+
+        // The importmap tag carries an integrity matching its own JSON body.
+        final RegExpMatch? importMapMatch = RegExp(
+          r'<script[^>]*type="importmap"[^>]*integrity="([^"]+)"[^>]*>(.+?)</script>',
+          dotAll: true,
+        ).firstMatch(html);
+        expect(importMapMatch, isNotNull,
+            reason: 'importmap must be stamped with `integrity`');
+        expect(importMapMatch!.group(1), equals(hashOf(importMapMatch.group(2)!)));
+
+        // The integrityMap script is stamped too.
+        final RegExpMatch? integrityScriptMatch = RegExp(
+          r'<script integrity="([^"]+)">(window\._flutter[^<]*)</script>',
+        ).firstMatch(html);
+        expect(integrityScriptMatch, isNotNull,
+            reason: 'integrityMap script must be stamped with `integrity`');
+        expect(
+          integrityScriptMatch!.group(1),
+          equals(hashOf(integrityScriptMatch.group(2)!)),
+        );
+      }),
+    );
+
+    test(
+      'WebIntegrity stamps integrity on user-authored inline <script>',
+      () => testbed.run(() async {
+        environment.defines[kSriEnabled] = 'true';
+        environment.defines[kSriAlgorithm] = 'sha384';
+        final Directory webResources = environment.projectDir.childDirectory('web');
+        webResources.childFile('index.html').createSync(recursive: true);
+        webResources.childFile('index.html').writeAsStringSync('''
+<!DOCTYPE html><html><head><base href="$kBaseHrefPlaceholder">
+<script>console.log("hello, world");</script>
+<script src="flutter_bootstrap.js" async></script>
+</head><body></body></html>
+''');
+        environment.buildDir.childFile('main.dart.js').createSync();
+        environment.buildDir.childFile('main.dart.js').writeAsStringSync('// fake\n');
+
+        await WebTemplatedFiles(<Map<String, Object?>>[]).build(environment);
+        await WebReleaseBundle(<WebCompilerConfig>[
+          const JsCompilerConfig(),
+        ], const NoOpAnalytics()).build(environment);
+        await WebIntegrity(globals.fs, <WebCompilerConfig>[
+          const JsCompilerConfig(),
+        ], const NoOpAnalytics()).build(environment);
+
+        final String html =
+            environment.outputDir.childFile('index.html').readAsStringSync();
+
+        const String body = 'console.log("hello, world");';
+        final crypto.Digest d = crypto.sha384.convert(utf8.encode(body));
+        final String expected = 'sha384-${base64.encode(d.bytes)}';
+        expect(
+          html,
+          contains('<script integrity="$expected">$body</script>'),
+        );
+
+        // …and the same hash makes it into the manifest's `inlineScripts`.
+        final Map<String, Object?> manifest = jsonDecode(
+          environment.outputDir
+              .childFile('integrity_manifest.json')
+              .readAsStringSync(),
+        ) as Map<String, Object?>;
+        final List<Object?> inlineScripts =
+            manifest['inlineScripts']! as List<Object?>;
+        expect(inlineScripts, contains(expected));
+        // The two framework-injected inline scripts (importmap +
+        // _flutter.integrityMap) are also recorded.
+        expect(inlineScripts.length, greaterThanOrEqualTo(3));
+      }),
+    );
+
+    test(
+      'WebIntegrity does not double-stamp inline <script integrity="…">',
+      () => testbed.run(() async {
+        environment.defines[kSriEnabled] = 'true';
+        final Directory webResources = environment.projectDir.childDirectory('web');
+        webResources.childFile('index.html').createSync(recursive: true);
+        webResources.childFile('index.html').writeAsStringSync('''
+<!DOCTYPE html><html><head><base href="$kBaseHrefPlaceholder">
+<script integrity="sha384-USERSUPPLIED">/* hand-pinned */</script>
+<script src="flutter_bootstrap.js" async></script>
+</head><body></body></html>
+''');
+        environment.buildDir.childFile('main.dart.js').createSync();
+        environment.buildDir.childFile('main.dart.js').writeAsStringSync('// fake\n');
+
+        await WebTemplatedFiles(<Map<String, Object?>>[]).build(environment);
+        await WebReleaseBundle(<WebCompilerConfig>[
+          const JsCompilerConfig(),
+        ], const NoOpAnalytics()).build(environment);
+        await WebIntegrity(globals.fs, <WebCompilerConfig>[
+          const JsCompilerConfig(),
+        ], const NoOpAnalytics()).build(environment);
+
+        final String html =
+            environment.outputDir.childFile('index.html').readAsStringSync();
+        // The hand-pinned tag survives untouched: the start tag still has
+        // exactly one `integrity="…"` and it's the user's value.
+        final RegExpMatch? userOpen = RegExp(
+          r'<script[^>]*integrity="sha384-USERSUPPLIED"[^>]*>',
+        ).firstMatch(html);
+        expect(userOpen, isNotNull,
+            reason: 'auto-stamping must skip inline scripts that already '
+                'carry an `integrity` attribute');
+        expect(
+          'integrity='.allMatches(userOpen!.group(0)!).length,
+          equals(1),
+        );
+        // And the body and closing tag are still in place.
+        expect(html, contains('/* hand-pinned */</script>'));
+      }),
+    );
+
+    test(
+      'WebIntegrity skips empty inline <script></script>',
+      () => testbed.run(() async {
+        environment.defines[kSriEnabled] = 'true';
+        final Directory webResources = environment.projectDir.childDirectory('web');
+        webResources.childFile('index.html').createSync(recursive: true);
+        webResources.childFile('index.html').writeAsStringSync('''
+<!DOCTYPE html><html><head><base href="$kBaseHrefPlaceholder">
+<script></script>
+<script src="flutter_bootstrap.js" async></script>
+</head><body></body></html>
+''');
+        environment.buildDir.childFile('main.dart.js').createSync();
+        environment.buildDir.childFile('main.dart.js').writeAsStringSync('// fake\n');
+
+        await WebTemplatedFiles(<Map<String, Object?>>[]).build(environment);
+        await WebReleaseBundle(<WebCompilerConfig>[
+          const JsCompilerConfig(),
+        ], const NoOpAnalytics()).build(environment);
+        await WebIntegrity(globals.fs, <WebCompilerConfig>[
+          const JsCompilerConfig(),
+        ], const NoOpAnalytics()).build(environment);
+
+        final String html =
+            environment.outputDir.childFile('index.html').readAsStringSync();
+        // The empty script remains exactly `<script></script>` — no integrity
+        // attribute (CSP doesn't allow inline-script hashes for empty bodies
+        // and stamping would just be noise).
+        expect(html, contains('<script></script>'));
+      }),
+    );
+  });
 
   group('--static-assets-url', () {
     test(

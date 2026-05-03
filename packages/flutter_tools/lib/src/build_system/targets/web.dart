@@ -26,6 +26,7 @@ import '../../project.dart';
 import '../../web/bootstrap.dart';
 import '../../web/compile.dart';
 import '../../web/file_generators/flutter_service_worker_js.dart';
+import '../../web/file_generators/inject_sub_resourece_integrity_html.dart';
 import '../../web/file_generators/main_dart.dart' as main_dart;
 import '../../web_template.dart';
 import '../build_system.dart';
@@ -933,6 +934,129 @@ class WebBuiltInAssets extends Target {
   }
 }
 
+/// Injects Sub-Resource Integrity (SRI) hashes into loader-managed assets.
+///
+/// Runs after [WebReleaseBundle] and [WebBuiltInAssets] have populated the
+/// output directory with everything that needs hashing — `main.dart.js`,
+/// `main.dart.wasm`, `main.dart.mjs`, `flutter.js`, the canvaskit/skwasm
+/// modules, etc. The order matters: we cannot compute integrity at
+/// [WebTemplatedFiles] time because no compiled assets exist in the output
+/// directory yet.
+///
+/// Emitted SRI hashes live the following places in the `index.html`:
+///
+///   * Static `integrity` attributes on `<script src>` / `<link rel>` tags.
+///   * An `<script type="importmap">{"integrity": {...}}</script>` block
+///     for browser-enforced SRI on dynamic `import()` of ES modules
+///     (canvaskit.js, skwasm.js, main.dart.mjs). This is Baseline-newly
+///     available since Firefox 138 (May 2025), Chrome 127 (Jun 2024),
+///     Safari 18 (Sep 2024).
+///   * An inline `<script>window._flutter.integrityMap = {...}</script>`
+///     block, read by the engine's `flutter.js` loader at runtime to stamp
+///     `integrity` on dynamically-injected classic `<script>` tags
+///     (currently `main.dart.js`, which is not loaded as an ES module).
+///
+/// The SRI hashes are emitted to a machine-readable `integrity_manifest.json`
+/// file in the output directory, which can be used for debugging, auditing,
+/// or by downstream tools such as CSP header generators.
+///
+/// When SRI is disabled this target is a no-op.
+class WebIntegrity extends Target {
+  WebIntegrity(this.fileSystem, this.compileConfigs, this.analytics);
+
+  final FileSystem fileSystem;
+  final List<WebCompilerConfig> compileConfigs;
+  final Analytics analytics;
+
+  @override
+  String get name => 'web_integrity';
+
+  @override
+  List<Target> get dependencies => <Target>[
+    WebReleaseBundle(compileConfigs, analytics),
+    WebBuiltInAssets(fileSystem),
+  ];
+
+  @override
+  List<String> get depfiles => const <String>[];
+
+  // todo: Unsure whether there may be a way to express these file dependencies
+  //  as actual inputs/outputs instead of having to do a full directory scan in
+  //  the build method. Though not sure if we can represent the file inputs as
+  //  all script/css/wasm files?!
+  @override
+  List<Source> get inputs => const <Source>[];
+
+  @override
+  List<Source> get outputs => const <Source>[];
+
+  /// File extensions whose contents we hash. Other types (images, fonts,
+  /// JSON manifests) are not loaded as `<script>` / `<link>` subresources
+  /// and so cannot be SRI-protected by the browser.
+  static const Set<String> _hashableExtensions = <String>{
+    '.js',
+    '.mjs',
+    '.css',
+    '.wasm',
+  };
+
+  @override
+  Future<void> build(Environment environment) async {
+    final integrity = IntegrityConfig.fromDefines(environment.defines);
+    if (!integrity.enabled) {
+      return;
+    }
+
+    final Directory outputDir = environment.outputDir;
+
+    // Hash all JavaScript, CSS, and WASM files in the output directory.
+    final integrityMap = <String, String>{};
+    for (final File file in outputDir.listSync(recursive: true).whereType<File>()) {
+      final String relative = fileSystem.path
+          .relative(file.path, from: outputDir.path)
+          .replaceAll(r'\', '/');
+      final String ext = fileSystem.path.extension(file.path).toLowerCase();
+      if (!_hashableExtensions.contains(ext)) {
+        continue;
+      }
+      integrityMap[relative] = generateIntegrityHash(
+        file.readAsBytesSync(),
+        algorithm: integrity.algorithm,
+      );
+    }
+
+    final inlineScriptHashes = <String>{};
+    for (final File file in outputDir.listSync(recursive: true).whereType<File>()) {
+      // Only inject integrity into the main `index.html` entry point,
+      // as Flutter apps typically only have one `index.html` file.
+      if (fileSystem.path.basename(file.path) != 'index.html') {
+        continue;
+      }
+      final PatchedHtml result = injectSubresourceIntegrity(
+        htmlFile: file,
+        outputDir: outputDir,
+        integrityMap: integrityMap,
+        fileSystem: fileSystem,
+        algorithm: integrity.algorithm,
+      );
+      if (result.isModified) {
+        file.writeAsStringSync(result.html);
+        inlineScriptHashes.addAll(result.userInlineScriptHashes);
+      }
+    }
+
+    // Write the integrity manifest for downstream tooling and debugging.
+    final File manifest = outputDir.childFile('integrity_manifest.json');
+    manifest.writeAsStringSync(
+      const JsonEncoder.withIndent('  ').convert(<String, Object?>{
+        'algorithm': integrity.algorithm,
+        'sameOrigin': integrityMap,
+        'inlineScripts': (inlineScriptHashes.toList()..sort()),
+      }),
+    );
+  }
+}
+
 /// Generate a service worker for a web target.
 class WebServiceWorker extends Target {
   const WebServiceWorker(this.fileSystem, this.compileConfigs, this.analytics);
@@ -948,6 +1072,7 @@ class WebServiceWorker extends Target {
   List<Target> get dependencies => <Target>[
     WebReleaseBundle(compileConfigs, analytics),
     WebBuiltInAssets(fileSystem),
+    WebIntegrity(fileSystem, compileConfigs, analytics),
   ];
 
   @override
