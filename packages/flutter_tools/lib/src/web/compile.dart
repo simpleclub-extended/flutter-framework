@@ -41,6 +41,56 @@ const kServiceWorkerStrategy = 'ServiceWorkerStrategy';
 /// Prefix for web-define variables stored in [Environment.defines].
 const kWebDefinePrefix = 'webDefine:';
 
+/// Whether to emit Sub-Resource Integrity (SRI) attributes in the output and
+/// verify dynamically loaded assets against build-time hashes.
+///
+/// Stored in [Environment.defines] as `'true'` / `'false'`. Defaults to off.
+const kSriEnabled = 'SriEnabled';
+
+/// The digest algorithm used when [kSriEnabled] is on.
+///
+/// Stored in [Environment.defines] as one of `sha256`, `sha384` (default), or
+/// `sha512`. SRI's strongly-recommended default is `sha384`.
+const kSriAlgorithm = 'SriAlgorithm';
+
+/// Bundle of SRI-related configuration. Constructed from [Environment.defines].
+class IntegrityConfig {
+  const IntegrityConfig._({required this.enabled, required this.algorithm});
+
+  /// Disabled (default) — no integrity attributes are emitted.
+  static const IntegrityConfig disabled = IntegrityConfig._(
+    enabled: false,
+    algorithm: 'sha384',
+  );
+
+  /// Reads the SRI knobs out of [defines].
+  ///
+  /// When `defines[kSriEnabled]` is missing or any value other than `'true'`,
+  /// returns [IntegrityConfig.disabled]. The algorithm defaults to `sha384`
+  /// when unset, which matches the SRI spec's recommendation
+  /// (https://www.w3.org/TR/SRI/).
+  factory IntegrityConfig.fromDefines(Map<String, String> defines) {
+    final bool enabled = defines[kSriEnabled] == 'true';
+    if (!enabled) {
+      return IntegrityConfig.disabled;
+    }
+    return IntegrityConfig._(
+      enabled: true,
+      algorithm: defines[kSriAlgorithm] ?? 'sha384',
+    );
+  }
+
+  /// Whether SRI should be applied to this build.
+  final bool enabled;
+
+  /// One of `sha256`, `sha384`, `sha512`. Always set, even when [enabled] is
+  /// false (so callers don't have to null-check; just gate on [enabled]).
+  final String algorithm;
+
+  /// Allowed values for [kSriAlgorithm].
+  static const Set<String> supportedAlgorithms = <String>{'sha256', 'sha384', 'sha512'};
+}
+
 class WebBuilder {
   WebBuilder({
     required Logger logger,
@@ -75,6 +125,7 @@ class WebBuilder {
     String? staticAssetsUrl,
     String? outputDirectoryPath,
     Map<String, String> webDefines = const <String, String>{},
+    IntegrityConfig integrity = IntegrityConfig.disabled,
   }) async {
     if (serviceWorkerStrategy != null) {
       _logger.printWarning(
@@ -119,6 +170,8 @@ class WebBuilder {
             kStaticAssetsUrl: ?staticAssetsUrl,
             kServiceWorkerStrategy:
                 serviceWorkerStrategy?.cliName ?? ServiceWorkerStrategy.offlineFirst.cliName,
+            if (integrity.enabled) kSriEnabled: 'true',
+            if (integrity.enabled) kSriAlgorithm: integrity.algorithm,
             ...buildInfo.toBuildSystemEnvironment(),
             for (final MapEntry(:key, :value) in webDefines.entries) '$kWebDefinePrefix$key': value,
           },

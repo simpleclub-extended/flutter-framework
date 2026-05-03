@@ -132,6 +132,29 @@ class BuildWebCommand extends BuildSubCommand {
     );
 
     //
+    // Sub-Resource Integrity (SRI) options
+    //
+    argParser.addSeparator('Sub-Resource Integrity options');
+    argParser.addFlag(
+      FlutterOptions.kWebSriFlag,
+      negatable: false,
+      help:
+          'Emit Sub-Resource Integrity attributes on every same-origin '
+          '<script src> and <link rel> tag in the generated index.html, and '
+          'verify dynamically loaded assets (main.dart.js, canvaskit.js, '
+          'skwasm.js, .wasm modules) against build-time hashes at runtime. '
+          'See https://www.w3.org/TR/SRI/.',
+    );
+    argParser.addOption(
+      FlutterOptions.kWebSriAlgorithmFlag,
+      help:
+          'The digest algorithm used for --sri. SHA-384 is the SRI spec '
+          'default and is recommended.',
+      allowed: IntegrityConfig.supportedAlgorithms,
+      defaultsTo: 'sha384',
+    );
+
+    //
     // WebAssembly compilation options
     //
     argParser.addSeparator('WebAssembly compilation options');
@@ -282,6 +305,12 @@ class BuildWebCommand extends BuildSubCommand {
     final String? outputDirectoryPath = stringArg('output');
 
     final Map<String, String> webDefines = extractWebDefines();
+    final IntegrityConfig integrity = boolArg(FlutterOptions.kWebSriFlag)
+        ? IntegrityConfig.fromDefines(<String, String>{
+            kSriEnabled: 'true',
+            kSriAlgorithm: stringArg(FlutterOptions.kWebSriAlgorithmFlag) ?? 'sha384',
+          })
+        : IntegrityConfig.disabled;
     final webBuilder = WebBuilder(
       logger: globals.logger,
       processManager: globals.processManager,
@@ -300,6 +329,7 @@ class BuildWebCommand extends BuildSubCommand {
       staticAssetsUrl: staticAssetsUrl,
       outputDirectoryPath: outputDirectoryPath,
       webDefines: webDefines,
+      integrity: integrity,
     );
     return FlutterCommandResult.success();
   }

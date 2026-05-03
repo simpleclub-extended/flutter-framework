@@ -148,6 +148,8 @@ abstract final class FlutterOptions {
   static const kUseApplicationBinary = 'use-application-binary';
   static const kWebBrowserFlag = 'web-browser-flag';
   static const kWebResourcesCdnFlag = 'web-resources-cdn';
+  static const kWebSriFlag = 'sri';
+  static const kWebSriAlgorithmFlag = 'sri-algorithm';
   static const kWebWasmFlag = 'wasm';
   static const kWebExperimentalHotReload = 'web-experimental-hot-reload';
   static const kEnableImpeller = 'enable-impeller';
