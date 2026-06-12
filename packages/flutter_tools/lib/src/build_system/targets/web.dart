@@ -985,20 +985,26 @@ class WebIntegrity extends Target {
   //  the build method. Though not sure if we can represent the file inputs as
   //  all script/css/wasm files?!
   @override
-  List<Source> get inputs => const <Source>[];
+  List<Source> get inputs => const <Source>[
+    // SRI hashes are computed from these emitted, same-origin subresources.
+    Source.pattern('{OUTPUT_DIR}/**/*.js'),
+    Source.pattern('{OUTPUT_DIR}/**/*.mjs'),
+    Source.pattern('{OUTPUT_DIR}/**/*.css'),
+    Source.pattern('{OUTPUT_DIR}/**/*.wasm'),
+    // SRI is injected into this entrypoint.
+    Source.pattern('{OUTPUT_DIR}/index.html'),
+  ];
 
   @override
-  List<Source> get outputs => const <Source>[];
+  List<Source> get outputs => const <Source>[
+    Source.pattern('{OUTPUT_DIR}/index.html'),
+    Source.pattern('{OUTPUT_DIR}/integrity_manifest.json'),
+  ];
 
   /// File extensions whose contents we hash. Other types (images, fonts,
   /// JSON manifests) are not loaded as `<script>` / `<link>` subresources
   /// and so cannot be SRI-protected by the browser.
-  static const Set<String> _hashableExtensions = <String>{
-    '.js',
-    '.mjs',
-    '.css',
-    '.wasm',
-  };
+  static const Set<String> _hashableExtensions = <String>{'.js', '.mjs', '.css', '.wasm'};
 
   @override
   Future<void> build(Environment environment) async {
